@@ -13,6 +13,11 @@ Usage:
 
   # Step 4: Validate a SCM file
   python main.py --mode validate --input output/new_main.scm
+
+Input files:
+  Single file:   data/raw/main.txt        (preferred — full decompiled main.scm)
+  Segmented:     data/raw/main_scm_segments/*.txt  (fallback if main.txt absent)
+  Map files:     data/raw/map/info.zon, data/raw/map/default.ide, data/raw/map/maps/**/*.IPL
 """
 
 import argparse
@@ -20,21 +25,35 @@ import os
 import glob
 import json
 
+
 def run_parse():
     print("=" * 60)
     print("STEP 1: PARSING GTA VC DATA FILES")
     print("=" * 60)
     os.makedirs("data/processed", exist_ok=True)
 
-    # Parse all SCM segments
     from parsers.scm_parser import SCMParser
-    scm_segments = sorted(glob.glob("data/raw/main_scm_segments/*.txt"))
     all_scripts = []
     all_missions = []
     all_objects = []
 
-    for seg in scm_segments:
-        print(f"  Parsing SCM segment: {seg}")
+    # Prefer single full file, fall back to segments
+    single_file = "data/raw/main.txt"
+    segments = sorted(glob.glob("data/raw/main_scm_segments/*.txt"))
+
+    if os.path.exists(single_file):
+        print(f"  Using single SCM file: {single_file}")
+        scm_files = [single_file]
+    elif segments:
+        print(f"  Using {len(segments)} segmented SCM files from data/raw/main_scm_segments/")
+        scm_files = segments
+    else:
+        print("  [WARNING] No SCM source files found.")
+        print("    Place data/raw/main.txt  OR  data/raw/main_scm_segments/*.txt")
+        scm_files = []
+
+    for seg in scm_files:
+        print(f"  Parsing: {seg}")
         parser = SCMParser(seg)
         scm = parser.parse()
         all_scripts.extend([{
@@ -85,10 +104,9 @@ def run_parse():
 
     # Build map graph
     from spatial.map_graph import MapGraph
-    mg = MapGraph(
-        zones_json="data/processed/zones_db.json" if os.path.exists("data/processed/zones_db.json") else None,
-        ipl_json="data/processed/ipl_instances.json" if os.path.exists("data/processed/ipl_instances.json") else None
-    )
+    zones_json = "data/processed/zones_db.json" if os.path.exists("data/processed/zones_db.json") else None
+    ipl_json = "data/processed/ipl_instances.json" if os.path.exists("data/processed/ipl_instances.json") else None
+    mg = MapGraph(zones_json=zones_json, ipl_json=ipl_json)
     mg.export_locations_json("data/processed/coords_db.json")
     print(f"  ✓ Built map graph with {len(mg.locations)} known locations")
 
@@ -113,10 +131,9 @@ def run_generate(num_missions: int, output_path: str):
     print("=" * 60)
     os.makedirs(os.path.dirname(output_path) or "output", exist_ok=True)
 
+    zones_json = "data/processed/zones_db.json" if os.path.exists("data/processed/zones_db.json") else None
     from spatial.map_graph import MapGraph
-    mg = MapGraph(
-        zones_json="data/processed/zones_db.json" if os.path.exists("data/processed/zones_db.json") else None
-    )
+    mg = MapGraph(zones_json=zones_json)
 
     model_path = "models/gtavc_scm_lora"
     if not os.path.exists(model_path):
@@ -137,11 +154,10 @@ def _generate_template_based(num_missions: int, output_path: str, map_graph):
 
     concepts = random.sample(MISSION_CONCEPTS, min(num_missions, len(MISSION_CONCEPTS)))
 
-    # Generate simple trigger scripts from template
+    from spatial.map_graph import KNOWN_LOCATIONS
     trigger_scripts = []
     for i, concept in enumerate(concepts):
-        from spatial.map_graph import KNOWN_LOCATIONS
-        loc = KNOWN_LOCATIONS.get(concept['start_location'], (83.0,-849.8,9.3,''))
+        loc = KNOWN_LOCATIONS.get(concept['start_location'], (83.0, -849.8, 9.3, ''))
         x, y, z = loc[0], loc[1], loc[2]
         idx = i + 2
         name = concept['name']
@@ -179,11 +195,9 @@ load_and_launch_mission_internal {idx}
 goto @{name}_LOOP
 """)
 
-    # Generate simple mission bodies
     mission_bodies = []
     for concept in concepts:
-        from spatial.map_graph import KNOWN_LOCATIONS
-        loc = KNOWN_LOCATIONS.get(concept['start_location'], (83.0,-849.8,9.3,''))
+        loc = KNOWN_LOCATIONS.get(concept['start_location'], (83.0, -849.8, 9.3, ''))
         tx, ty, tz = loc[0] + 10, loc[1] + 10, loc[2]
         name = concept['name']
         body = f"""
@@ -254,9 +268,9 @@ def run_validate(input_path: str):
 
     is_valid, issues = validator.validate(scm_text)
     if is_valid:
-        print(f"  ✓ SCM is valid!")
+        print("  ✓ SCM is valid!")
     else:
-        print(f"  ✗ SCM has issues:")
+        print("  ✗ SCM has issues:")
     for issue in issues:
         print(f"    - {issue}")
 
