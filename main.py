@@ -1,6 +1,7 @@
 """
 GTA Vice City AI SCM Generator — Main Pipeline Entry Point
-Corrected: added --mode scrape step for opcode/ID data generation.
+Corrected: run_parse() now also calls PathsParser for road/ped node extraction.
+MapGraph now receives paths_json parameter.
 """
 import argparse
 import os
@@ -16,12 +17,13 @@ def run_parse():
     from parsers.ipl_parser import IPLParser
     from parsers.ide_parser import IDEParser
     from parsers.scm_parser import SCMParser
+    from parsers.paths_parser import PathsParser
     import json
     from pathlib import Path
 
     Path("data/processed").mkdir(parents=True, exist_ok=True)
 
-    # Parse zone file
+    # ── Parse zone file ──────────────────────────────────────────────────────
     zon_path = "data/raw/map/info.zon"
     if os.path.exists(zon_path):
         zp = ZonParser(zon_path)
@@ -31,8 +33,10 @@ def run_parse():
     else:
         print(f"[Parse] WARNING: {zon_path} not found — skipping zone parse")
 
-    # Parse IDE files (default.ide + area IDEs)
-    ide_files = ["data/raw/map/default.ide"] + glob.glob("data/raw/map/maps/**/*.IDE", recursive=True)
+    # ── Parse IDE files ───────────────────────────────────────────���──────────
+    ide_files = ["data/raw/map/default.ide"] + \
+                glob.glob("data/raw/map/maps/**/*.IDE", recursive=True) + \
+                glob.glob("data/raw/map/maps/**/*.ide", recursive=True)
     all_ide_entries = []
     for ide_path in ide_files:
         if os.path.exists(ide_path):
@@ -51,7 +55,7 @@ def run_parse():
             json.dump(all_ide_entries, f, indent=2)
         print(f"[Parse] IDE: {len(all_ide_entries)} entries saved")
 
-    # Parse IPL files
+    # ── Parse IPL files ──────────────────────────────────────────────────────
     ipl_files = glob.glob("data/raw/map/maps/**/*.IPL", recursive=True) + \
                 glob.glob("data/raw/map/maps/**/*.ipl", recursive=True)
     all_instances = []
@@ -82,7 +86,27 @@ def run_parse():
             json.dump({"instances": all_instances, "zones": all_zones_ipl}, f)
         print(f"[Parse] IPL: {len(all_instances)} instances, {len(all_zones_ipl)} zones saved")
 
-    # Parse SCM — try full file first, then segments
+    # ── Parse path nodes (NEW) ───────────────────────────────────────────────
+    # Path nodes are the most accurate source of drivable/walkable coordinates.
+    # They come from two sources:
+    #   1. 'path' sections inside IPL files
+    #   2. DATA/paths/*.DAT text files (e.g. ROADBLOCKS.DAT)
+    pp = PathsParser()
+
+    maps_dir = "data/raw/map/maps"
+    if os.path.isdir(maps_dir):
+        pp.parse_all_ipls(maps_dir)
+
+    paths_dir = "data/raw/paths"
+    if os.path.isdir(paths_dir):
+        pp.parse_paths_dat_dir(paths_dir)
+    else:
+        print(f"[Parse] Info: {paths_dir} not found — "
+              f"copy DATA\\paths\\ folder to data/raw/paths/ for better coord quality")
+
+    pp.to_json("data/processed/path_nodes.json")
+
+    # ── Parse SCM ────────────────────────────────────────────────────────────
     scm_parsed = False
     for scm_path in ["data/raw/main.txt", "data/raw/stripped.txt"]:
         if os.path.exists(scm_path):
@@ -99,7 +123,6 @@ def run_parse():
                 print(f"[Parse] Warning: could not parse {scm_path}: {ex}")
 
     if not scm_parsed:
-        # Try segments
         seg_files = sorted(glob.glob("data/raw/main_scm_segments/*.txt"))
         if seg_files:
             combined = ""
@@ -143,13 +166,14 @@ def run_train():
         print("[Train] ERROR: Run --mode parse first to generate scm_parsed.json")
         return
 
-    # Build dataset
     from spatial.map_graph import MapGraph
-    zones_path = "data/processed/zones_db.json"
-    ipl_path = "data/processed/ipl_instances.json"
+    zones_path  = "data/processed/zones_db.json"
+    ipl_path    = "data/processed/ipl_instances.json"
+    paths_path  = "data/processed/path_nodes.json"
     mg = MapGraph(
-        zones_json=zones_path if os.path.exists(zones_path) else None,
-        ipl_json=ipl_path if os.path.exists(ipl_path) else None
+        zones_json=zones_path  if os.path.exists(zones_path)  else None,
+        ipl_json=ipl_path      if os.path.exists(ipl_path)    else None,
+        paths_json=paths_path  if os.path.exists(paths_path)  else None,
     )
 
     from training.dataset_builder import DatasetBuilder
@@ -157,7 +181,6 @@ def run_train():
     db.build_all()
     db.save_jsonl("data/processed/training_pairs.jsonl")
 
-    # Fine-tune
     from training.finetune import train
     train()
 
@@ -170,12 +193,14 @@ def run_generate(num_missions: int, output_path: str):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    zones_path = "data/processed/zones_db.json"
-    ipl_path = "data/processed/ipl_instances.json"
+    zones_path  = "data/processed/zones_db.json"
+    ipl_path    = "data/processed/ipl_instances.json"
+    paths_path  = "data/processed/path_nodes.json"
     from spatial.map_graph import MapGraph
     mg = MapGraph(
-        zones_json=zones_path if os.path.exists(zones_path) else None,
-        ipl_json=ipl_path if os.path.exists(ipl_path) else None
+        zones_json=zones_path  if os.path.exists(zones_path)  else None,
+        ipl_json=ipl_path      if os.path.exists(ipl_path)    else None,
+        paths_json=paths_path  if os.path.exists(paths_path)  else None,
     )
 
     model_path = "models/gtavc_scm_lora"
@@ -299,7 +324,11 @@ def run_validate(input_path: str):
     from spatial.map_graph import MapGraph
 
     zones_path = "data/processed/zones_db.json"
-    mg = MapGraph(zones_json=zones_path if os.path.exists(zones_path) else None)
+    paths_path = "data/processed/path_nodes.json"
+    mg = MapGraph(
+        zones_json=zones_path if os.path.exists(zones_path) else None,
+        paths_json=paths_path if os.path.exists(paths_path) else None,
+    )
     validator = SCMValidator(map_graph=mg)
 
     with open(input_path) as f:
@@ -312,7 +341,6 @@ def run_validate(input_path: str):
         print(f"[Validate] ❌ Found {len(errors)} issue(s):")
         for e in errors:
             print(f"  - {e}")
-
         print("\n[Validate] Attempting auto-fix...")
         fixed = validator.auto_fix_coords(scm_text)
         fixed_path = input_path.replace(".scm", "_fixed.scm").replace(".txt", "_fixed.txt")
@@ -323,9 +351,11 @@ def run_validate(input_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GTA VC AI SCM Generator")
-    parser.add_argument("--mode", choices=["parse", "scrape", "train", "generate", "validate", "all"],
+    parser.add_argument("--mode",
+                        choices=["parse", "scrape", "train", "generate", "validate", "all"],
                         required=True, help="Pipeline mode")
-    parser.add_argument("--missions", type=int, default=5, help="Number of missions to generate")
+    parser.add_argument("--missions", type=int, default=5,
+                        help="Number of missions to generate")
     parser.add_argument("--output", type=str, default="output/new_main.scm",
                         help="Output path for generated SCM")
     parser.add_argument("--input", type=str, default="output/new_main.scm",
