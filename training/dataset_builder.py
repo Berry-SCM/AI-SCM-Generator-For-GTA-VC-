@@ -1,428 +1,275 @@
 """
-Builds fine-tuning dataset from parsed SCM scripts.
-Creates (prompt, completion) pairs for LLM training.
-
-Training pair formats:
-1. Opcode teaching:    "What opcode creates a pickup at coordinates?" -> example
-2. Mission structure:  "Write a mission that [desc]" -> full mission script
-3. Script completion:  first-half -> second-half of real scripts
-4. Coordinate pairs:   "Place something at [location]" -> SCM with correct coords
-5. ID reference:       "What ID is the taxi?" -> "150" (from parsed default.ide)
+Builds fine-tuning dataset from parsed SCM JSON + map data.
+Corrected: loads opcode/vehicle/ped/weapon ID data from processed JSON files
+produced by training/opcode_scraper.py.
 """
-
 import json
 import os
 import random
-from typing import List, Dict
+from pathlib import Path
+from typing import List, Dict, Optional
 
 MISSION_STRUCTURE_TEMPLATE = '''You are an expert GTA Vice City SCM script writer.
-Write complete mission scripts using proper GTA VC opcodes and syntax.
-
-Rules:
-- Use locate_player_on_foot_3d for trigger zones
-- Always check Player.Defined() and Player.Controllable() before triggering
-- Use $onmission flag to prevent double-triggers
-- Use print_big for mission name display
-- Use load_and_launch_mission_internal to load a mission
-- Coordinates must be valid Vice City world coords
-- Use wait 500 in polling loops, wait 0 in tight active loops
-- End trigger scripts with terminate_this_script when passed flag is set
-- Handle mission failure (player death) with end_thread
-- Use Blip.Remove() and cleanup before ending
+Given a mission concept, write a complete, valid SCM mission script.
+Use correct opcodes, real Vice City coordinates, and proper label/goto structure.
+Always end missions with terminate_this_script.
+Always reset $onmission = 0 on both pass and fail paths.
 '''
 
+# Fallback hardcoded examples (used if opcodes.json not found)
 OPCODE_EXAMPLES = {
-    'create_actor': {
-        'prompt': 'How do I create an NPC actor in GTA VC SCM?',
-        'completion': '''// Create an actor at position (pedtype 4=CIVMALE, model #MALE01)
-$actor = Actor.Create(4, #MALE01, -378.5, -551.3, 18.2)
-// Set actor facing angle
-Actor.Angle($actor) = 180.0
-// Give weapon (weapon_id 17 = AR15/M16, ammo 100)
-give_weapon_to_char $actor weapon 17 ammo 100
-// Set health
-Actor.Health($actor) = 100'''
+    "wait": {
+        "description": "Wait N milliseconds before continuing",
+        "example": "wait 2000  // wait 2 seconds"
     },
-    'create_car': {
-        'prompt': 'How do I spawn a vehicle at a specific location in SCM?',
-        'completion': '''// Spawn car at position (x, y, z) then set angle
-$car = Car.Create(#TAXI, 200.0, -800.0, 10.5)
-Car.Angle($car) = 90.0
-// Or use car generator for persistent spawns that survive missions
-create_car_generator $gen = init_car_generator #TAXI -1 -1 force_spawn 1 alarm 0 door_lock 0 min_delay 0 max_delay 10000 at 200.0 -800.0 10.5 angle 90.0
-switch_car_generator $gen cars_to_generate_to -1'''
+    "goto": {
+        "description": "Jump unconditionally to a label",
+        "example": "goto @MISSION_LOOP"
     },
-    'mission_trigger': {
-        'prompt': 'How do I create a mission trigger zone in SCM?',
-        'completion': ''':MYMISSION_LOOP
-wait 500
-if
-  $passed_MYMISSION == 1
-goto_if_false @MYMISSION_CHECK
-terminate_this_script
-
-:MYMISSION_CHECK
-if
-  Player.Defined($player_char)
-goto_if_false @MYMISSION_LOOP
-if
-  not $onmission == 1
-goto_if_false @MYMISSION_LOOP
-if
-  locate_player_on_foot_3d $player_char 0 200.0 -800.0 10.5 radius 2.0 2.0 2.0
-goto_if_false @MYMISSION_LOOP
-$onmission = 1
-load_and_launch_mission_internal 3
-terminate_this_script'''
+    "goto_if_false": {
+        "description": "Jump to label if the last condition was false",
+        "example": "if\n  Player.Defined($player_char)\ngoto_if_false @FAIL"
     },
-    'create_pickup': {
-        'prompt': 'How do I create a pickup object in GTA VC SCM?',
-        'completion': '''// Pickup types: 1=on ground, 2=floating, 3=regenerate, 15=money
-$pickup = Pickup.Create(#HEALTH, 15, 83.0, -849.8, 9.3)
-// Check if player collected it
-if
-  Pickup.Collected($pickup)
-goto_if_false @PICKUP_LOOP
-// Pickup collected
-Pickup.Destroy($pickup)'''
+    "terminate_this_script": {
+        "description": "End the current script thread",
+        "example": "terminate_this_script"
     },
-    'blip_marker': {
-        'prompt': 'How do I add a radar blip / marker in GTA VC SCM?',
-        'completion': '''// Add blip on a coord (type 0 = red square)
-$blip = Blip.AddForCoord(200.0, -800.0, 10.5)
-Blip.ChangeDisplay($blip, 2)  // 2 = blip only visible on map
-// Or add to a vehicle
-$car_blip = Blip.AddForCar($car)
-// Remove when done
-Blip.Remove($blip)'''
+    "load_and_launch_mission_internal": {
+        "description": "Load and start a mission by index",
+        "example": "load_and_launch_mission_internal 5  // start mission 5"
     },
-    'mission_pass_fail': {
-        'prompt': 'How do I handle mission pass and fail in GTA VC SCM?',
-        'completion': ''':MISSION_FAIL_CHECK
-if
-  Actor.Dead($player_actor)
-goto_if_false @MISSION_MAIN
-// Player died - mission fail
-Blip.Remove($obj_marker)
-$onmission = 0
-print_now 'M_FAIL' time 3000 1
-end_thread
-
-:MISSION_PASS
-Blip.Remove($obj_marker)
-$passed_MYMISSION = 1
-$onmission = 0
-add_score $player_char score 1000
-player_made_progress 1
-print_now 'M_PASS' time 5000 1
-end_thread'''
+    "Actor.Create": {
+        "description": "Spawn an actor (ped) at coordinates",
+        "example": "$enemy = Actor.Create(4, #WMYCR, 200.0, -800.0, 10.5)"
     },
-    'timer': {
-        'prompt': 'How do I use a countdown timer in GTA VC SCM?',
-        'completion': '''// TIMERA and TIMERB are built-in millisecond counters
-TIMERA = 0
-
-:TIMER_LOOP
-if
-  TIMERA <= 30000
-goto_if_false @TIMER_EXPIRED
-wait 0
-goto @TIMER_LOOP
-
-:TIMER_EXPIRED
-// 30 seconds have elapsed
-print_now 'TIME_UP' time 3000 1'''
+    "Car.Create": {
+        "description": "Spawn a vehicle at coordinates",
+        "example": "$getaway = Car.Create(#SENTINEL, 210.0, -810.0, 10.5)"
     },
-    'camera': {
-        'prompt': 'How do I control the camera in a GTA VC mission cutscene?',
-        'completion': '''// Fade screen to black
-set_fading_colour 0 0 0
-do_fade 0 1500
-wait 1500
-// Position camera
-Camera.SetPosition(-378.5, -551.3, 25.0, 0.0, 0.0, 0.0)
-// Point camera at a target
-Camera.PointAt(-378.5, -560.0, 20.0, 2)
-// Enable widescreen bars
-switch_widescreen 1
-wait 3000
-// Restore player camera
-Camera.Restore()
-set_area_visible 0
-Player.CanMove($player_char, True)
-release_weather
-// Fade back in
-do_fade 1 1000'''
+    "locate_player_on_foot_3d": {
+        "description": "Check if player is near a 3D coordinate on foot",
+        "example": "locate_player_on_foot_3d $player_char 0 200.0 -800.0 10.5 radius 3.0 3.0 3.0"
     },
-    'save_system': {
-        'prompt': 'How does the save/property system work in GTA VC SCM?',
-        'completion': '''// Properties use asset pickups; $passed_MISSION flags track completion.
-// Declare the mission flag at global scope:
-declare_mission_flag $onmission
-
-// Mark a mission as passed:
-$passed_MYMISSION = 1
-$onmission = 0
-
-// Trigger scripts check the flag to know if already completed:
-if
-  $passed_MYMISSION == 1
-goto_if_false @CHECK_TRIGGER
-terminate_this_script  // already done, stop polling
-:CHECK_TRIGGER
-
-// Track progress:
-player_made_progress 1'''
+    "create_marker": {
+        "description": "Create a visible marker sphere at coordinates",
+        "example": "$marker = create_marker 4 at 200.0 -800.0 10.5"
+    },
+    "give_player_weapon": {
+        "description": "Give the player a weapon with ammo",
+        "example": "give_player_weapon $player_char 274 100  // colt45, 100 ammo"
     },
 }
 
 
 class DatasetBuilder:
     def __init__(self, scm_json_path: str, map_graph=None):
-        with open(scm_json_path) as f:
-            self.scm_data = json.load(f)
+        self.scm_json_path = scm_json_path
         self.map_graph = map_graph
+        self.scm_data: Dict = {}
         self.pairs: List[Dict] = []
 
-    def build_opcode_pairs(self):
-        """Add opcode teaching examples to training set."""
-        for key, example in OPCODE_EXAMPLES.items():
-            self.pairs.append({
-                'type': 'opcode_teaching',
-                'messages': [
-                    {'role': 'system', 'content': MISSION_STRUCTURE_TEMPLATE},
-                    {'role': 'user', 'content': example['prompt']},
-                    {'role': 'assistant', 'content': example['completion']}
+        # Load parsed SCM data
+        if os.path.exists(scm_json_path):
+            with open(scm_json_path) as f:
+                self.scm_data = json.load(f)
+            print(f"[DatasetBuilder] Loaded SCM data: {len(self.scm_data.get('scripts', []))} scripts")
+        else:
+            print(f"[DatasetBuilder] Warning: SCM JSON not found at {scm_json_path}")
+
+        # Load ID reference data (produced by opcode_scraper.py)
+        processed_dir = "data/processed"
+        self.vehicle_ids: Dict = {}
+        self.ped_ids: Dict = {}
+        self.weapon_ids: Dict = {}
+        self.opcodes: Dict = {}
+
+        for fname, attr in [
+            ("vehicle_ids.json", "vehicle_ids"),
+            ("ped_ids.json", "ped_ids"),
+            ("weapon_ids.json", "weapon_ids"),
+            ("opcodes.json", "opcodes"),
+        ]:
+            fpath = os.path.join(processed_dir, fname)
+            if os.path.exists(fpath):
+                with open(fpath) as f:
+                    setattr(self, attr, json.load(f))
+                print(f"[DatasetBuilder] Loaded {fpath}")
+            else:
+                print(f"[DatasetBuilder] Warning: {fpath} not found — run training/opcode_scraper.py first")
+
+    def build_opcode_pairs(self) -> List[Dict]:
+        """Build Q&A pairs for opcode usage."""
+        pairs = []
+
+        # From hardcoded OPCODE_EXAMPLES
+        for opcode_name, data in OPCODE_EXAMPLES.items():
+            pairs.append({
+                "messages": [
+                    {"role": "system", "content": MISSION_STRUCTURE_TEMPLATE},
+                    {"role": "user", "content": f"How do I use the '{opcode_name}' opcode in GTA VC SCM?"},
+                    {"role": "assistant", "content": f"{data['description']}\n\nExample:\n{data['example']}"}
                 ]
             })
-        print(f"[DatasetBuilder] Added {len(OPCODE_EXAMPLES)} opcode pairs")
 
-    def build_script_pairs(self):
-        """Convert parsed SCM scripts into training pairs."""
-        scripts = self.scm_data.get('scripts', [])
-        missions = {m['label']: m for m in self.scm_data.get('missions', [])}
+        # From scraped opcodes.json (if available)
+        for opcode_hex, data in self.opcodes.items():
+            name = data.get("name", opcode_hex)
+            desc = data.get("desc", "")
+            args = data.get("args", "")
+            pairs.append({
+                "messages": [
+                    {"role": "system", "content": MISSION_STRUCTURE_TEMPLATE},
+                    {"role": "user", "content": f"What does opcode {opcode_hex} ({name}) do in GTA VC SCM?"},
+                    {"role": "assistant", "content": f"Opcode {opcode_hex}: {name}\nArguments: {args}\n{desc}"}
+                ]
+            })
 
-        count_before = len(self.pairs)
+        # Vehicle ID pairs (from vehicle_ids.json)
+        for vid, vname in self.vehicle_ids.items():
+            pairs.append({
+                "messages": [
+                    {"role": "system", "content": MISSION_STRUCTURE_TEMPLATE},
+                    {"role": "user", "content": f"How do I spawn a {vname} in a VC SCM mission?"},
+                    {"role": "assistant", "content": f"$car = Car.Create(#{vname.upper()}, x, y, z)  // vehicle ID {vid}"}
+                ]
+            })
+
+        # Weapon ID pairs (from weapon_ids.json)
+        for wid, wname in self.weapon_ids.items():
+            pairs.append({
+                "messages": [
+                    {"role": "system", "content": MISSION_STRUCTURE_TEMPLATE},
+                    {"role": "user", "content": f"Give the player a {wname} in SCM."},
+                    {"role": "assistant", "content": f"give_player_weapon $player_char {wid} 100  // {wname}"}
+                ]
+            })
+
+        self.pairs.extend(pairs)
+        return pairs
+
+    def build_script_pairs(self) -> List[Dict]:
+        """Build training pairs from actual parsed SCM scripts."""
+        pairs = []
+        scripts = self.scm_data.get("scripts", [])
+
         for script in scripts:
-            raw_lines = script.get('raw', [])
-            if len(raw_lines) < 5:
+            name = script.get("name", "UNKNOWN")
+            label = script.get("label", "")
+            instructions = script.get("instructions", [])
+            mission_idx = script.get("mission_index")
+
+            if len(instructions) < 3:
                 continue
 
-            script_text = '\n'.join(raw_lines)
-            mission_name = script.get('name', script.get('label', 'UNKNOWN'))
-            mission_info = missions.get(mission_name, {})
-            display_name = mission_info.get('name', mission_name)
+            # Build raw script text
+            script_lines = []
+            for instr in instructions[:60]:  # cap to avoid token overflow
+                raw = instr.get("raw", "").strip()
+                if raw:
+                    script_lines.append(raw)
 
-            # Pair 1: Full script reproduction
-            prompt = (f"Write the SCM script for '{display_name}' "
-                      f"(script name: {mission_name}) in GTA Vice City. "
-                      f"Include proper trigger detection, mission flag checking, "
-                      f"and mission launch.")
-            self.pairs.append({
-                'type': 'script_reproduction',
-                'messages': [
-                    {'role': 'system', 'content': MISSION_STRUCTURE_TEMPLATE},
-                    {'role': 'user', 'content': prompt},
-                    {'role': 'assistant', 'content': script_text}
+            if not script_lines:
+                continue
+
+            script_text = "\n".join(script_lines)
+
+            # Training pair: explain what the script does
+            pairs.append({
+                "messages": [
+                    {"role": "system", "content": MISSION_STRUCTURE_TEMPLATE},
+                    {"role": "user", "content": f"Explain this GTA VC SCM script section '{name}':"},
+                    {"role": "assistant", "content": f"This is the '{name}' script (label @{label}).\n\n```\n{script_text}\n```"}
                 ]
             })
 
-            # Pair 2: Script completion (first half -> second half)
-            if len(raw_lines) > 20:
-                half = len(raw_lines) // 2
-                first_half = '\n'.join(raw_lines[:half])
-                second_half = '\n'.join(raw_lines[half:])
-                self.pairs.append({
-                    'type': 'script_completion',
-                    'messages': [
-                        {'role': 'system', 'content': MISSION_STRUCTURE_TEMPLATE},
-                        {'role': 'user',
-                         'content': f"Complete this GTA VC SCM script:\n\n{first_half}"},
-                        {'role': 'assistant', 'content': second_half}
+            # If it's a mission, ask to generate similar
+            if mission_idx is not None:
+                coords = script.get("coords_used", [])
+                coord_str = ""
+                if coords:
+                    cx, cy, cz = coords[0]
+                    coord_str = f" near ({cx}, {cy}, {cz})"
+                pairs.append({
+                    "messages": [
+                        {"role": "system", "content": MISSION_STRUCTURE_TEMPLATE},
+                        {"role": "user", "content": f"Write a GTA VC SCM mission similar to mission {mission_idx} ('{name}'){coord_str}."},
+                        {"role": "assistant", "content": f":{name}\nscript_name '{name[:8]}'\n$onmission = 1\n\n{script_text}\n\nterminate_this_script"}
                     ]
                 })
 
-        added = len(self.pairs) - count_before
-        print(f"[DatasetBuilder] Added {added} script pairs from {len(scripts)} scripts")
+        self.pairs.extend(pairs)
+        return pairs
 
-    def build_coord_pairs(self):
-        """
-        Build coordinate-to-location training pairs.
-        Uses live MapGraph locations if available (includes IPL-enriched data),
-        otherwise falls back to the hardcoded KNOWN_LOCATIONS table.
-        """
-        from spatial.map_graph import KNOWN_LOCATIONS
+    def build_coord_pairs(self) -> List[Dict]:
+        """Build training pairs for coordinate-aware placement."""
+        pairs = []
 
-        # Build location dict: prefer MapGraph (has zone + IPL data), else hardcoded
-        if self.map_graph is not None:
-            location_items = [
-                (loc.name, loc.x, loc.y, loc.z, loc.description, loc.zone)
-                for loc in self.map_graph.locations.values()
-                if loc.location_type in ('mission_trigger', 'business', 'gang_turf')
-            ]
-        else:
-            location_items = [
-                (name, x, y, z, desc, '')
-                for name, (x, y, z, desc) in KNOWN_LOCATIONS.items()
-            ]
+        if self.map_graph is None:
+            return pairs
 
-        count_before = len(self.pairs)
-        for name, x, y, z, desc, zone in location_items:
-            human_name = name.replace('_', ' ')
-            self.pairs.append({
-                'type': 'coord_knowledge',
-                'messages': [
-                    {'role': 'user',
-                     'content': f'What are the coordinates for {human_name} in GTA Vice City SCM?'},
-                    {'role': 'assistant',
-                     'content': (
-                         f'The {human_name} location ({desc}) is at '
-                         f'X={x}, Y={y}, Z={z}'
-                         + (f', zone: {zone}' if zone else '') + '.\n'
-                         f'In SCM: locate_player_on_foot_3d $player_char 0 '
-                         f'{x} {y} {z} radius 2.0 2.0 2.0'
-                     )}
-                ]
-            })
-        print(f"[DatasetBuilder] Added {len(self.pairs) - count_before} coord pairs")
+        # Zone-based pairs
+        zone_examples = [
+            ("OCEAN_BEACH", 400.0, -800.0, 10.5),
+            ("WASHINGTON", 100.0, -600.0, 10.5),
+            ("LITTLE_HAITI", -900.0, 200.0, 10.5),
+            ("AIRPORT", -1700.0, -100.0, 14.0),
+            ("DOCKS", -1100.0, -1400.0, 11.5),
+            ("VICE_POINT", 500.0, 200.0, 10.5),
+            ("DOWNTOWN", 200.0, 900.0, 10.5),
+        ]
 
-    def build_id_reference_pairs(self):
-        """
-        Build vehicle/ped/weapon ID reference training pairs from the parsed IDE file.
-        Teaches the model: 'What ID is the taxi?' -> '150 (#TAXI)'
-        Only runs if data/processed/ide_entries.json exists (produced by run_parse).
-        """
-        ide_path = "data/processed/ide_entries.json"
-        if not os.path.exists(ide_path):
-            print("[DatasetBuilder] Skipping ID pairs: ide_entries.json not found (run --mode parse first)")
-            return
-
-        with open(ide_path) as f:
-            ide_data = json.load(f)
-
-        entries = ide_data.get('entries', [])
-        count_before = len(self.pairs)
-
-        # Group by type for bulk Q&A
-        cars, peds, weapons = [], [], []
-        for e in entries:
-            etype = e.get('entry_type', '')
-            if etype == 'cars':
-                cars.append(e)
-            elif etype == 'peds':
-                peds.append(e)
-            elif etype == 'weap':
-                weapons.append(e)
-
-        # --- Individual ID lookup pairs ---
-        for e in cars:
-            name = e.get('model_name', '')
-            eid = e.get('id', '')
-            if not name or not eid:
-                continue
-            self.pairs.append({
-                'type': 'id_reference',
-                'messages': [
-                    {'role': 'user',
-                     'content': f'What is the vehicle model ID for {name} in GTA Vice City SCM?'},
-                    {'role': 'assistant',
-                     'content': (f'The vehicle {name} has model ID {eid}. '
-                                 f'In SCM use: $car = Car.Create(#{name.upper()}, x, y, z)')}
+        for zone_name, x, y, z in zone_examples:
+            pairs.append({
+                "messages": [
+                    {"role": "system", "content": MISSION_STRUCTURE_TEMPLATE},
+                    {"role": "user", "content": f"Give me a valid outdoor spawn coordinate in {zone_name} for a mission trigger."},
+                    {"role": "assistant", "content": f"In {zone_name}, use approximately ({x}, {y}, {z}).\nSCM: $marker = create_marker 4 at {x} {y} {z}"}
                 ]
             })
 
-        for e in peds:
-            name = e.get('model_name', '')
-            eid = e.get('id', '')
-            if not name or not eid:
-                continue
-            self.pairs.append({
-                'type': 'id_reference',
-                'messages': [
-                    {'role': 'user',
-                     'content': f'What is the ped skin ID for {name} in GTA Vice City?'},
-                    {'role': 'assistant',
-                     'content': (f'The ped {name} has skin ID {eid}. '
-                                 f'In SCM use: $actor = Actor.Create(pedtype, #{name.upper()}, x, y, z)')}
-                ]
-            })
+        # Known location pairs
+        try:
+            locations = self.map_graph.get_locations_by_type('mission_trigger')
+            for loc in locations[:20]:
+                pairs.append({
+                    "messages": [
+                        {"role": "system", "content": MISSION_STRUCTURE_TEMPLATE},
+                        {"role": "user", "content": f"Where should I place a mission trigger near {loc.description}?"},
+                        {"role": "assistant", "content": f"Place the trigger at ({loc.x}, {loc.y}, {loc.z}) in zone {loc.zone}.\nSCM:\n$marker = create_marker 4 at {loc.x} {loc.y} {loc.z}"}
+                    ]
+                })
+        except Exception:
+            pass
 
-        for e in weapons:
-            name = e.get('model_name', '')
-            eid = e.get('id', '')
-            if not name or not eid:
-                continue
-            self.pairs.append({
-                'type': 'id_reference',
-                'messages': [
-                    {'role': 'user',
-                     'content': f'What is the weapon ID for {name} in GTA Vice City SCM?'},
-                    {'role': 'assistant',
-                     'content': (f'The weapon {name} has ID {eid}. '
-                                 f'In SCM use: give_weapon_to_char $actor weapon {eid} ammo 100')}
-                ]
-            })
-
-        # --- Bulk list pairs (teach the model the full ID tables) ---
-        if cars:
-            car_list = '\n'.join(
-                f"  {e['id']:>3}: #{e['model_name'].upper()}" for e in cars
-                if e.get('id') and e.get('model_name')
-            )
-            self.pairs.append({
-                'type': 'id_reference',
-                'messages': [
-                    {'role': 'user',
-                     'content': 'List all vehicle model IDs available in GTA Vice City SCM.'},
-                    {'role': 'assistant',
-                     'content': f'Vehicle IDs (use as #MODELNAME in Car.Create):\n{car_list}'}
-                ]
-            })
-
-        if weapons:
-            weap_list = '\n'.join(
-                f"  {e['id']:>3}: {e['model_name']}" for e in weapons
-                if e.get('id') and e.get('model_name')
-            )
-            self.pairs.append({
-                'type': 'id_reference',
-                'messages': [
-                    {'role': 'user',
-                     'content': 'List all weapon IDs available in GTA Vice City SCM.'},
-                    {'role': 'assistant',
-                     'content': f'Weapon IDs (use as integer in give_weapon_to_char):\n{weap_list}'}
-                ]
-            })
-
-        if peds:
-            ped_list = '\n'.join(
-                f"  {e['id']:>3}: #{e['model_name'].upper()}" for e in peds
-                if e.get('id') and e.get('model_name')
-            )
-            self.pairs.append({
-                'type': 'id_reference',
-                'messages': [
-                    {'role': 'user',
-                     'content': 'List all ped skin IDs available in GTA Vice City SCM.'},
-                    {'role': 'assistant',
-                     'content': f'Ped skin IDs (use as #MODELNAME in Actor.Create):\n{ped_list}'}
-                ]
-            })
-
-        added = len(self.pairs) - count_before
-        print(f"[DatasetBuilder] Added {added} ID reference pairs "
-              f"({len(cars)} vehicles, {len(peds)} peds, {len(weapons)} weapons)")
+        self.pairs.extend(pairs)
+        return pairs
 
     def build_all(self) -> List[Dict]:
+        """Build all training pairs."""
+        print("[DatasetBuilder] Building opcode pairs...")
         self.build_opcode_pairs()
+        print("[DatasetBuilder] Building script pairs...")
         self.build_script_pairs()
+        print("[DatasetBuilder] Building coord pairs...")
         self.build_coord_pairs()
-        self.build_id_reference_pairs()   # ← new: was missing entirely
+
+        # Also load pre-built ID pairs from opcode_scraper if they exist
+        id_pairs_path = "data/processed/id_training_pairs.jsonl"
+        if os.path.exists(id_pairs_path):
+            with open(id_pairs_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        self.pairs.append(json.loads(line))
+            print(f"[DatasetBuilder] Loaded ID training pairs from {id_pairs_path}")
+
+        print(f"[DatasetBuilder] Total pairs: {len(self.pairs)}")
         return self.pairs
 
     def save_jsonl(self, out_path: str):
-        self.build_all()
-        with open(out_path, 'w') as f:
+        """Save training pairs to JSONL file."""
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
             for pair in self.pairs:
-                f.write(json.dumps(pair) + '\n')
-        print(f"[DatasetBuilder] Saved {len(self.pairs)} pairs to {out_path}")
+                f.write(json.dumps(pair) + "\n")
+        print(f"[DatasetBuilder] Saved {len(self.pairs)} pairs → {out_path}")
