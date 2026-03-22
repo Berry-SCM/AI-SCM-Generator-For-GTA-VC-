@@ -51,8 +51,9 @@ TRAINING_ARGS = TrainingArguments(
 )
 # ────────────────────────────────────────────────────────
 
+
 def load_dataset(path: str) -> Dataset:
-    """Load JSONL training pairs and format for SFTTrainer"""
+    """Load JSONL training pairs and format for SFTTrainer."""
     records = []
     with open(path) as f:
         for line in f:
@@ -69,37 +70,25 @@ def load_dataset(path: str) -> Dataset:
 
 def format_chat(messages: list) -> str:
     """
-    Format chat messages into CodeLlama B_INST/E_INST instruction format.
-
-    Correct format merges the system block with the FIRST user turn:
-        [INST] <<SYS>>
-        {system}
-        <</SYS>>
-
-        {first_user_message} [/INST] {assistant_response}
-
-    Subsequent user turns:
-        [INST] {user_message} [/INST] {assistant_response}
+    Format chat messages into CodeLlama instruction format.
+    Handles system/user/assistant roles correctly.
     """
     result = ""
-    system_content = ""
-    system_merged = False  # whether system has been merged into a user [INST] block
+    has_sys = False
+    sys_content = ""
 
     for msg in messages:
         role = msg.get('role', '')
         content = msg.get('content', '')
-
         if role == 'system':
-            system_content = content
-
+            sys_content = content
+            has_sys = True
         elif role == 'user':
-            if system_content and not system_merged:
-                # Merge system + first user turn into one [INST] block
-                result += f"[INST] <<SYS>>\n{system_content}\n<</SYS>>\n\n{content} [/INST] "
-                system_merged = True
+            if has_sys:
+                result += f"[INST] <<SYS>>\n{sys_content}\n<</SYS>>\n\n{content} [/INST]\n"
+                has_sys = False  # sys block consumed
             else:
-                result += f"[INST] {content} [/INST] "
-
+                result += f"[INST] {content} [/INST]\n"
         elif role == 'assistant':
             result += f"{content}\n"
 
@@ -107,7 +96,7 @@ def format_chat(messages: list) -> str:
 
 
 def load_model_and_tokenizer(model_name: str):
-    """Load model with 4-bit quantization for memory efficiency"""
+    """Load model with 4-bit quantization for memory efficiency."""
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
