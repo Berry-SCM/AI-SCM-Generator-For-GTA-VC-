@@ -1,7 +1,7 @@
 """
 Generates new GTA VC mission scripts using the fine-tuned LLM.
 Combines:
-  - LLM for natural language → SCM script
+  - LLM for natural language -> SCM script
   - MapGraph for valid coordinate injection
   - Validator for opcode/syntax checking
 """
@@ -9,7 +9,7 @@ Combines:
 import json
 import random
 from typing import List, Optional, Dict
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 import torch
 
@@ -59,6 +59,7 @@ MISSION_CONCEPTS = [
     },
 ]
 
+
 class MissionGenerator:
     def __init__(self,
                  model_path: str,
@@ -99,13 +100,13 @@ class MissionGenerator:
     def generate_trigger_script(self, concept: Dict,
                                  mission_index: int,
                                  trigger_coord: tuple) -> str:
-        """Generate the trigger/ambient script for a mission concept"""
+        """Generate the trigger/ambient script for a mission concept."""
         x, y, z = trigger_coord
         name = concept['name']
         display = concept['display']
 
         prompt = f"""[INST] <<SYS>>
-You are an expert GTA Vice City SCM script writer. Write syntactically correct SCM scripts.
+{self.tokenizer.decode([], skip_special_tokens=True)}You are an expert GTA Vice City SCM script writer. Write syntactically correct SCM scripts.
 <</SYS>>
 
 Write a GTA VC SCM trigger script for mission '{display}' with script name '{name}'.
@@ -113,8 +114,8 @@ The mission trigger is at coordinates X={x}, Y={y}, Z={z}.
 Mission index is {mission_index}.
 The script should:
 1. Use script_name '{name}'
-2. Loop with wait $default_wait_time
-3. Check if $passed_{name} == 1 and terminate if so
+2. Loop with wait 500
+3. Check if $passed_{name} == 1 and terminate_this_script if so
 4. Check Player.Defined, locate_player_on_foot_3d with radius 2.0 2.0 2.0, $onmission == 0, Player.Controllable
 5. Set $onmission = 1, Player.MakeSafe, print_big '{name[:8]}' 15000 ms 2
 6. Call load_and_launch_mission_internal {mission_index}
@@ -122,21 +123,22 @@ The script should:
 [/INST]
 """
         result = self._generate(prompt, max_new_tokens=512)
-        # Extract only the assistant response
         if "[/INST]" in result:
             result = result.split("[/INST]")[-1].strip()
         return result
 
     def generate_mission_body(self, concept: Dict) -> str:
-        """Generate the full mission body script"""
+        """Generate the full mission body script."""
         desc = concept['description']
         objectives = concept.get('objectives', [])
         vehicles = concept.get('required_vehicles', [])
         start_loc = concept.get('start_location', 'hotel_spawn')
 
-        # Get real coords for objectives
-        start = KNOWN_LOCATIONS.get(start_loc, (83.0, -849.8, 9.3, ''))
-        x, y, z = start[0], start[1], start[2]
+        loc_data = KNOWN_LOCATIONS.get(start_loc)
+        if loc_data:
+            x, y, z = loc_data[0], loc_data[1], loc_data[2]
+        else:
+            x, y, z = 83.0, -849.8, 9.3
 
         obj_text = '\n'.join(f'- {obj}' for obj in objectives)
         veh_text = ', '.join(f'#{v}' for v in vehicles) if vehicles else 'any vehicle'
@@ -155,12 +157,12 @@ Objectives in order:
 
 Requirements:
 - Use proper labels like :MISSIONNAME_step
-- Use $onmission flag, declare it properly
-- Handle mission failure (player death) with end_thread  
-- Handle mission success: print 'M_PASS', add_score, $passed_{concept['name']} = 1
+- Declare and use $onmission flag
+- Handle mission failure (player death) with end_thread
+- Handle mission success: print_now 'M_PASS', add_score, $passed_{concept['name']} = 1, end_thread
 - Use real Vice City coordinates
-- Include actor/vehicle cleanup on end
-- Use wait 0 in active loops, wait $default_wait_time in polling loops
+- Include Blip.Remove and actor/vehicle cleanup before ending
+- Use wait 0 in active loops, wait 500 in polling loops
 
 [/INST]
 """
@@ -171,7 +173,7 @@ Requirements:
 
     def generate_full_mod(self, num_missions: int = 5,
                           output_path: str = "output/new_main.scm") -> str:
-        """Generate a complete new main.scm mod"""
+        """Generate a complete new main.scm mod."""
         print(f"[MissionGenerator] Generating {num_missions} missions...")
 
         selected = random.sample(MISSION_CONCEPTS, min(num_missions, len(MISSION_CONCEPTS)))
@@ -179,10 +181,9 @@ Requirements:
         mission_bodies = []
 
         for i, concept in enumerate(selected):
-            mission_idx = i + 2  # start after intro missions
-            loc_name = concept.get('start_location', 'hotel_spawn')
-            loc = KNOWN_LOCATIONS.get(loc_name)
-            coord = (loc[0], loc[1], loc[2]) if loc else (83.0, -849.8, 9.3)
+            mission_idx = i + 2
+            loc_data = KNOWN_LOCATIONS.get(concept.get('start_location', 'hotel_spawn'))
+            coord = (loc_data[0], loc_data[1], loc_data[2]) if loc_data else (83.0, -849.8, 9.3)
 
             print(f"  Generating trigger for: {concept['display']}")
             trigger = self.generate_trigger_script(concept, mission_idx, coord)
@@ -206,9 +207,8 @@ Requirements:
         return scm_text
 
 
-# ── Simple assembler (no LLM needed) ─────────────────────
 class SCMAssembler:
-    """Assembles a complete main.scm from parts"""
+    """Assembles a complete main.scm from parts."""
 
     DEFINE_OBJECTS_TEMPLATE = """DEFINE OBJECTS 10
 DEFINE OBJECT (noname)
@@ -305,11 +305,14 @@ end_thread
         lines.append("DEFINE MISSION 1 AT @INTRO             // Intro")
         for i, concept in enumerate(self.missions):
             idx = i + 2
-            lines.append(f"DEFINE MISSION {idx} AT @{concept['name']}           // {concept['display']}")
+            lines.append(
+                f"DEFINE MISSION {idx} AT @{concept['name']}           "
+                f"// {concept['display']}"
+            )
         return '\n'.join(lines)
 
     def _make_bribe_pickups(self) -> str:
-        # Use some known bribe locations from original main.scm
+        # Known bribe locations from original main.scm
         bribes = [
             (393.9, -60.2, 11.5),
             (116.0, -1313.1, 4.4),
@@ -323,7 +326,7 @@ end_thread
         return '\n'.join(lines)
 
     def _make_car_generators(self) -> str:
-        # A few basic car generators at key locations
+        # Basic car generators at key spawn locations
         cars = [
             ('#SENTINEL', 83.0, -860.0, 9.3, 90.0),
             ('#TAXI', 120.0, -850.0, 9.3, 90.0),
@@ -356,24 +359,20 @@ end_thread
 """
 
     def assemble(self) -> str:
-        parts = []
-        parts.append(self.DEFINE_OBJECTS_TEMPLATE)
-        parts.append(self._make_define_missions())
-        parts.append(self.MAIN_HEADER_TEMPLATE.format(
-            num_missions=len(self.missions),
-            car_generators=self._make_car_generators(),
-            bribe_pickups=self._make_bribe_pickups(),
-            start_scripts=self._make_start_scripts(),
-        ))
-        parts.append(self.INITIAL_MISSION_TEMPLATE)
-        parts.append(self._intro_mission())
-
-        # Append trigger scripts
+        parts = [
+            self.DEFINE_OBJECTS_TEMPLATE,
+            self._make_define_missions(),
+            self.MAIN_HEADER_TEMPLATE.format(
+                num_missions=len(self.missions),
+                car_generators=self._make_car_generators(),
+                bribe_pickups=self._make_bribe_pickups(),
+                start_scripts=self._make_start_scripts(),
+            ),
+            self.INITIAL_MISSION_TEMPLATE,
+            self._intro_mission(),
+        ]
         for script in self.trigger_scripts:
             parts.append('\n' + script)
-
-        # Append mission bodies
         for name, body in self.mission_bodies:
             parts.append(f'\n// === MISSION: {name} ===\n' + body)
-
         return '\n'.join(parts)
