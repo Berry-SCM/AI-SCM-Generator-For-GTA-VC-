@@ -15,9 +15,12 @@ Usage:
   python main.py --mode validate --input output/new_main.scm
 
 Input files:
-  Single file:   data/raw/main.txt        (preferred — full decompiled main.scm)
+  Single file:   data/raw/main.txt               (preferred — full decompiled main.scm)
   Segmented:     data/raw/main_scm_segments/*.txt  (fallback if main.txt absent)
-  Map files:     data/raw/map/info.zon, data/raw/map/default.ide, data/raw/map/maps/**/*.IPL
+  Stripped:      data/raw/stripped.txt            (optional — bare-minimum SCM)
+  Map files:     data/raw/map/info.zon
+                 data/raw/map/default.ide
+                 data/raw/map/maps/**/*.IPL
 """
 
 import argparse
@@ -33,31 +36,38 @@ def run_parse():
     os.makedirs("data/processed", exist_ok=True)
 
     from parsers.scm_parser import SCMParser
+
     all_scripts = []
     all_missions = []
     all_objects = []
 
-    # Prefer single full file, fall back to segments
+    # Prefer single full file; fall back to segments
     single_file = "data/raw/main.txt"
-    segments = sorted(glob.glob("data/raw/main_scm_segments/*.txt"))
+    segment_pattern = "data/raw/main_scm_segments/*.txt"
 
     if os.path.exists(single_file):
-        print(f"  Using single SCM file: {single_file}")
         scm_files = [single_file]
-    elif segments:
-        print(f"  Using {len(segments)} segmented SCM files from data/raw/main_scm_segments/")
-        scm_files = segments
+        print(f"  Using single SCM file: {single_file}")
     else:
-        print("  [WARNING] No SCM source files found.")
-        print("    Place data/raw/main.txt  OR  data/raw/main_scm_segments/*.txt")
-        scm_files = []
+        scm_files = sorted(glob.glob(segment_pattern))
+        if not scm_files:
+            print(f"  [WARNING] No SCM files found at {single_file} or {segment_pattern}")
+        else:
+            print(f"  Using {len(scm_files)} segmented SCM files")
+
+    # Also parse stripped SCM if present (adds more pattern variety)
+    stripped_file = "data/raw/stripped.txt"
+    if os.path.exists(stripped_file) and stripped_file not in scm_files:
+        scm_files.append(stripped_file)
+        print(f"  Also parsing stripped SCM: {stripped_file}")
 
     for seg in scm_files:
-        print(f"  Parsing: {seg}")
+        print(f"  Parsing SCM: {seg}")
         parser = SCMParser(seg)
         scm = parser.parse()
         all_scripts.extend([{
-            'name': s.name, 'label': s.label,
+            'name': s.name,
+            'label': s.label,
             'coords': s.coords_used,
             'variables': s.variables_used,
             'raw': [i.raw for i in s.instructions]
@@ -72,19 +82,26 @@ def run_parse():
     }
     with open("data/processed/scm_parsed.json", 'w') as f:
         json.dump(combined, f, indent=2)
-    print(f"  ✓ Parsed {len(all_scripts)} scripts, {len(all_missions)} missions")
+    print(f"  ✓ Parsed {len(all_scripts)} scripts, {len(all_missions)} missions, "
+          f"{len(all_objects)} objects")
 
-    # Parse zone files
+    # Parse zone file (info.zon)
     from parsers.zon_parser import ZonParser
-    if os.path.exists("data/raw/map/info.zon"):
-        zon = ZonParser("data/raw/map/info.zon")
+    zon_path = "data/raw/map/info.zon"
+    if os.path.exists(zon_path):
+        zon = ZonParser(zon_path)
         zon.parse()
         zon.to_json("data/processed/zones_db.json")
         print(f"  ✓ Parsed {len(zon.zones)} zones")
+    else:
+        print(f"  [WARNING] Zone file not found: {zon_path}")
 
     # Parse IPL files
     from parsers.ipl_parser import IPLParser
     ipl_files = glob.glob("data/raw/map/maps/**/*.IPL", recursive=True)
+    # Also try lowercase extension
+    ipl_files += glob.glob("data/raw/map/maps/**/*.ipl", recursive=True)
+    ipl_files = list(set(ipl_files))  # deduplicate
     all_instances = []
     for ipl_path in ipl_files:
         ipl = IPLParser(ipl_path)
@@ -94,25 +111,31 @@ def run_parse():
         json.dump({'instances': all_instances}, f)
     print(f"  ✓ Parsed {len(all_instances)} IPL instances from {len(ipl_files)} files")
 
-    # Parse IDE for car/ped/weapon IDs
+    # Parse IDE file (car/ped/weapon IDs)
     from parsers.ide_parser import IDEParser
-    if os.path.exists("data/raw/map/default.ide"):
-        ide = IDEParser("data/raw/map/default.ide")
+    ide_path = "data/raw/map/default.ide"
+    if os.path.exists(ide_path):
+        ide = IDEParser(ide_path)
         ide.parse()
         ide.to_json("data/processed/ide_entries.json")
         print(f"  ✓ Parsed {len(ide.entries)} IDE entries")
+    else:
+        print(f"  [WARNING] IDE file not found: {ide_path}")
 
-    # Build map graph
+    # Build map graph (with zones + IPL for full spatial context)
     from spatial.map_graph import MapGraph
-    zones_json = "data/processed/zones_db.json" if os.path.exists("data/processed/zones_db.json") else None
-    ipl_json = "data/processed/ipl_instances.json" if os.path.exists("data/processed/ipl_instances.json") else None
-    mg = MapGraph(zones_json=zones_json, ipl_json=ipl_json)
+    zones_path = "data/processed/zones_db.json"
+    ipl_path_out = "data/processed/ipl_instances.json"
+    mg = MapGraph(
+        zones_json=zones_path if os.path.exists(zones_path) else None,
+        ipl_json=ipl_path_out if os.path.exists(ipl_path_out) else None
+    )
     mg.export_locations_json("data/processed/coords_db.json")
     print(f"  ✓ Built map graph with {len(mg.locations)} known locations")
 
     # Build training dataset
     from training.dataset_builder import DatasetBuilder
-    builder = DatasetBuilder("data/processed/scm_parsed.json", mg)
+    builder = DatasetBuilder("data/processed/scm_parsed.json", map_graph=mg)
     builder.save_jsonl("data/processed/training_pairs.jsonl")
     print(f"  ✓ Training dataset: {len(builder.pairs)} pairs")
 
@@ -129,11 +152,17 @@ def run_generate(num_missions: int, output_path: str):
     print("=" * 60)
     print("STEP 3: GENERATING NEW MAIN.SCM")
     print("=" * 60)
-    os.makedirs(os.path.dirname(output_path) or "output", exist_ok=True)
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-    zones_json = "data/processed/zones_db.json" if os.path.exists("data/processed/zones_db.json") else None
+    zones_path = "data/processed/zones_db.json"
+    ipl_path = "data/processed/ipl_instances.json"
     from spatial.map_graph import MapGraph
-    mg = MapGraph(zones_json=zones_json)
+    mg = MapGraph(
+        zones_json=zones_path if os.path.exists(zones_path) else None,
+        ipl_json=ipl_path if os.path.exists(ipl_path) else None
+    )
 
     model_path = "models/gtavc_scm_lora"
     if not os.path.exists(model_path):
@@ -148,25 +177,31 @@ def run_generate(num_missions: int, output_path: str):
 
 
 def _generate_template_based(num_missions: int, output_path: str, map_graph):
-    """Fallback generator using templates without LLM"""
+    """Fallback generator using templates without LLM."""
     from generator.mission_generator import SCMAssembler, MISSION_CONCEPTS
     import random
 
     concepts = random.sample(MISSION_CONCEPTS, min(num_missions, len(MISSION_CONCEPTS)))
 
-    from spatial.map_graph import KNOWN_LOCATIONS
     trigger_scripts = []
+    mission_bodies = []
+
     for i, concept in enumerate(concepts):
-        loc = KNOWN_LOCATIONS.get(concept['start_location'], (83.0, -849.8, 9.3, ''))
-        x, y, z = loc[0], loc[1], loc[2]
+        from spatial.map_graph import KNOWN_LOCATIONS
+        loc_data = KNOWN_LOCATIONS.get(concept['start_location'])
+        if loc_data:
+            x, y, z = loc_data[0], loc_data[1], loc_data[2]
+        else:
+            x, y, z = 83.0, -849.8, 9.3
         idx = i + 2
         name = concept['name']
+
         trigger_scripts.append(f"""
 :{name}
 script_name '{name}'
 
 :{name}_LOOP
-wait $default_wait_time
+wait 500
 if
   $passed_{name} == 1
 goto_if_false @{name}_CHECK
@@ -190,17 +225,12 @@ Player.MakeSafe($player_char)
 set_fading_colour 0 0 0
 do_fade 0 1500
 print_big '{name[:8]}' 15000 ms 2
-HELP_2932()
 load_and_launch_mission_internal {idx}
 goto @{name}_LOOP
 """)
 
-    mission_bodies = []
-    for concept in concepts:
-        loc = KNOWN_LOCATIONS.get(concept['start_location'], (83.0, -849.8, 9.3, ''))
-        tx, ty, tz = loc[0] + 10, loc[1] + 10, loc[2]
-        name = concept['name']
-        body = f"""
+        tx, ty, tz = round(x + 10, 3), round(y + 10, 3), z
+        mission_bodies.append((name, f"""
 :M{name}
 script_name 'M{name}'
 $onmission = 1
@@ -238,8 +268,7 @@ $onmission = 0
 add_score $player_char score 1000
 print_now 'M_PASS' time 5000 1
 end_thread
-"""
-        mission_bodies.append((name, body))
+"""))
 
     assembler = SCMAssembler(
         missions=concepts,
@@ -260,7 +289,8 @@ def run_validate(input_path: str):
     from generator.validator import SCMValidator
     from spatial.map_graph import MapGraph
 
-    mg = MapGraph()
+    zones_path = "data/processed/zones_db.json"
+    mg = MapGraph(zones_json=zones_path if os.path.exists(zones_path) else None)
     validator = SCMValidator(mg)
 
     with open(input_path) as f:
