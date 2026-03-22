@@ -13,7 +13,7 @@ from spatial.map_graph import MapGraph
 VALID_COORD_RANGE = {
     'x': (-2000, 1000),
     'y': (-1900, 1800),
-    'z': (0, 200),
+    'z': (-10, 200),   # -10 to cover tunnels/underpasses; map_graph uses 0 for outdoor only
 }
 
 REQUIRED_PATTERNS = [
@@ -34,55 +34,46 @@ class SCMValidator:
         self.map_graph = map_graph
 
     def validate(self, scm_text: str) -> Tuple[bool, List[str]]:
-        errors = []
-        warnings = []
+        issues = []
 
-        # Check label consistency: every goto target must have a label definition
+        # 1. Check all goto targets have a matching label definition
         defined_labels = set(LABEL_DEF_RE.findall(scm_text))
-        goto_labels = set(GOTO_RE.findall(scm_text))
-        missing_labels = goto_labels - defined_labels
-        if missing_labels:
-            errors.append(f"Missing label definitions: {missing_labels}")
+        goto_targets = set(GOTO_RE.findall(scm_text))
+        missing_labels = goto_targets - defined_labels
+        for lbl in sorted(missing_labels):
+            issues.append(f'goto target @{lbl} has no matching label definition')
 
-        # Check coordinates are within Vice City bounds
-        coords = COORD_RE.findall(scm_text)
-        suspicious_coords = []
-        for x, y, z in coords:
+        # 2. Check coordinate ranges
+        for m in COORD_RE.finditer(scm_text):
             try:
-                fx, fy, fz = float(x), float(y), float(z)
-                out_of_range = False
-                if not (VALID_COORD_RANGE['x'][0] <= fx <= VALID_COORD_RANGE['x'][1]):
-                    out_of_range = True
-                if not (VALID_COORD_RANGE['y'][0] <= fy <= VALID_COORD_RANGE['y'][1]):
-                    out_of_range = True
-                if not (VALID_COORD_RANGE['z'][0] <= fz <= VALID_COORD_RANGE['z'][1]):
-                    out_of_range = True
-                if out_of_range:
-                    suspicious_coords.append(f"({fx}, {fy}, {fz})")
+                x, y, z = float(m.group(1)), float(m.group(2)), float(m.group(3))
             except ValueError:
-                pass
-        if suspicious_coords:
-            # Deduplicate and cap output
-            unique = list(dict.fromkeys(suspicious_coords))[:5]
-            warnings.append(f"Suspicious out-of-range coords: {unique}")
+                continue
+            xmin, xmax = VALID_COORD_RANGE['x']
+            ymin, ymax = VALID_COORD_RANGE['y']
+            zmin, zmax = VALID_COORD_RANGE['z']
+            if not (xmin <= x <= xmax):
+                issues.append(f'X coord out of range: {x}')
+            if not (ymin <= y <= ymax):
+                issues.append(f'Y coord out of range: {y}')
+            if not (zmin <= z <= zmax):
+                issues.append(f'Z coord out of range: {z}')
 
-        # Check structural patterns (warnings only — not all files need all patterns)
+        # 3. Check required structural patterns
         for pattern, msg in REQUIRED_PATTERNS:
             if not re.search(pattern, scm_text):
-                warnings.append(msg)
+                issues.append(msg)
 
-        is_valid = len(errors) == 0
-        return is_valid, errors + warnings
+        return (len(issues) == 0), issues
 
     def auto_fix_coords(self, scm_text: str) -> str:
         """Clamp obviously out-of-range coordinates to valid Vice City bounds."""
         def fix_coord(m):
             try:
-                x, y, z = float(m.group(1)), float(m.group(2)), float(m.group(3))
-                x = max(VALID_COORD_RANGE['x'][0], min(VALID_COORD_RANGE['x'][1], x))
-                y = max(VALID_COORD_RANGE['y'][0], min(VALID_COORD_RANGE['y'][1], y))
-                z = max(VALID_COORD_RANGE['z'][0], min(VALID_COORD_RANGE['z'][1], z))
-                return f"{x:.3f} {y:.3f} {z:.3f}"
+                x = max(VALID_COORD_RANGE['x'][0], min(VALID_COORD_RANGE['x'][1], float(m.group(1))))
+                y = max(VALID_COORD_RANGE['y'][0], min(VALID_COORD_RANGE['y'][1], float(m.group(2))))
+                z = max(VALID_COORD_RANGE['z'][0], min(VALID_COORD_RANGE['z'][1], float(m.group(3))))
+                return f'{x:.3f} {y:.3f} {z:.3f}'
             except ValueError:
                 return m.group(0)
         return COORD_RE.sub(fix_coord, scm_text)
