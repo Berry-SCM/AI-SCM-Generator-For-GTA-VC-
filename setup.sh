@@ -1,5 +1,5 @@
 #!/bin/bash
-# Setup script
+# Setup script for GTA VC SCM AI Pipeline
 
 echo "Creating directory structure..."
 mkdir -p data/raw/main_scm_segments
@@ -8,28 +8,37 @@ mkdir -p data/processed
 mkdir -p models
 mkdir -p output
 
-echo ""
-echo "=== COPYING YOUR GTA VC DATA FILES ==="
-echo ""
-echo "OPTION A (preferred) — single full SCM file:"
-echo "  Copy your full decompiled main.scm text to:"
-echo "    data/raw/main.txt"
-echo ""
-echo "OPTION B (fallback) — segmented SCM files:"
-echo "  Copy main[0]_1.txt, main[0]_2.txt, etc. to:"
-echo "    data/raw/main_scm_segments/"
-echo "  (The pipeline uses this if data/raw/main.txt is absent)"
-echo ""
-echo "MAP FILES — copy all of these:"
-echo "  info.zon, gta_vc.dat, default.ide  →  data/raw/map/"
-echo "  All *.IPL files                    →  data/raw/map/maps/<area>/"
-echo ""
+echo "Creating Python package __init__.py files..."
+touch parsers/__init__.py
+touch spatial/__init__.py
+touch training/__init__.py
+touch generator/__init__.py
 
+echo ""
+echo "Placing your GTA VC data files:"
+echo "  Option A (preferred) — single full SCM file:"
+echo "    Copy your full decompiled main.scm text to:  data/raw/main.txt"
+echo "    Copy your stripped SCM (bare minimum) to:    data/raw/stripped.txt"
+echo ""
+echo "  Option B (fallback) — segmented files:"
+echo "    Copy main[0]_1.txt, main[0]_2.txt, etc. to: data/raw/main_scm_segments/"
+echo ""
+echo "  Map files (copy from your GTA VC DATA directory):"
+echo "    data/raw/map/info.zon"
+echo "    data/raw/map/default.ide"
+echo "    data/raw/map/maps/<area>/<area>.IPL  (all IPL files)"
+echo ""
+echo "  Game location (Steam default):"
+echo "    C:\\Program Files (x86)\\Steam\\steamapps\\common\\Grand Theft Auto Vice City\\"
+echo "    DATA\\  -> contains info.zon, default.ide, gta_vc.dat"
+echo "    DATA\\MAPS\\  -> contains all .IPL and .IDE area files"
+
+echo ""
 echo "Installing Python dependencies..."
 pip install -r requirements.txt
 
 echo ""
-echo "Done! Run pipeline:"
+echo "Done! Run the pipeline:"
 echo "  python main.py --mode parse"
 echo "  python main.py --mode train       # requires GPU, ~4-8 hours"
 echo "  python main.py --mode generate --missions 5"
