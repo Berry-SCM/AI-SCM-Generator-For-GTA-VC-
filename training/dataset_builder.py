@@ -12,7 +12,9 @@ Training pair formats:
 import json
 import random
 from typing import List, Dict, Tuple
-from parsers.scm_parser import SCMParser, SCMScript
+
+# Use KNOWN_LOCATIONS as the single authoritative coord source
+from spatial.map_graph import KNOWN_LOCATIONS
 
 MISSION_STRUCTURE_TEMPLATE = '''You are an expert GTA Vice City SCM script writer.
 Write a complete mission script using proper GTA VC opcodes and syntax.
@@ -20,7 +22,7 @@ Write a complete mission script using proper GTA VC opcodes and syntax.
 Rules:
 - Use locate_player_on_foot_3d for trigger zones
 - Always check Player.Defined() and Player.Controllable() before triggering
-- Use $onmission flag to prevent double-triggers  
+- Use $onmission flag to prevent double-triggers
 - Use print_big for mission name, load_and_launch_mission_internal for loading
 - Coordinates must be valid Vice City world coords
 - Use wait $default_wait_time in loops
@@ -121,7 +123,7 @@ print_now 'TIME_UP' time 3000 1'''
         'completion': '''// Fade out
 set_fading_colour 0 0 0
 do_fade 0 1500
-// Set camera position  
+// Set camera position
 Camera.SetPosition(-378.5, -551.3, 25.0, 0.0, 0.0, 0.0)
 // Point camera at target
 Camera.PointAt(-378.5, -560.0, 20.0, 2)
@@ -133,6 +135,7 @@ Camera.Restore()
 do_fade 1 1000'''
     },
 }
+
 
 class DatasetBuilder:
     def __init__(self, scm_json_path: str, map_graph=None):
@@ -167,12 +170,15 @@ class DatasetBuilder:
             script_text = '\n'.join(raw_lines)
             mission_name = script.get('name', script.get('label', 'UNKNOWN'))
 
-            # Find matching mission info
             mission_info = missions.get(mission_name, {})
             display_name = mission_info.get('name', mission_name)
 
             # Pair 1: Full script reproduction
-            prompt = f"Write the SCM script for the '{display_name}' script (label: {mission_name}) in GTA Vice City. Include proper trigger detection, mission flag checking, and mission launch."
+            prompt = (
+                f"Write the SCM script for the '{display_name}' script "
+                f"(label: {mission_name}) in GTA Vice City. Include proper trigger "
+                f"detection, mission flag checking, and mission launch."
+            )
             self.pairs.append({
                 'type': 'script_reproduction',
                 'messages': [
@@ -199,20 +205,28 @@ class DatasetBuilder:
         print(f"[DatasetBuilder] Added {len(scripts)} script pairs")
 
     def build_coord_pairs(self):
-        """Build coordinate-to-location pairs"""
-        for name, data in {**{k: v for k,v in {
-            'hotel': (83.0, -849.8, 9.3),
-            'mansion': (-378.5, -551.3, 18.2),
-            'docks': (-685.8, -1495.6, 12.5),
-            'airport': (-1720.3, -239.6, 14.8),
-            'downtown': (-665.63, 1231.863, 10.1),
-        }.items()}}.items():
-            x, y, z = data
+        """
+        Build coordinate-to-location pairs using KNOWN_LOCATIONS as the
+        single authoritative source (consistent with MapGraph).
+        """
+        for name, data in KNOWN_LOCATIONS.items():
+            x, y, z, desc = data
             self.pairs.append({
                 'type': 'coord_knowledge',
                 'messages': [
-                    {'role': 'user', 'content': f'What are the coordinates for {name} in GTA Vice City SCM?'},
-                    {'role': 'assistant', 'content': f'The {name} location in Vice City is at coordinates X={x}, Y={y}, Z={z}.\nIn SCM: locate_player_on_foot_3d $player_char 0 {x} {y} {z} radius 2.0 2.0 2.0'}
+                    {
+                        'role': 'user',
+                        'content': f'What are the coordinates for {name} in GTA Vice City SCM?'
+                    },
+                    {
+                        'role': 'assistant',
+                        'content': (
+                            f'The {name} location ({desc}) in Vice City is at '
+                            f'coordinates X={x}, Y={y}, Z={z}.\n'
+                            f'In SCM: locate_player_on_foot_3d $player_char 0 '
+                            f'{x} {y} {z} radius 2.0 2.0 2.0'
+                        )
+                    }
                 ]
             })
 
