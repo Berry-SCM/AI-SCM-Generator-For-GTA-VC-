@@ -56,29 +56,55 @@ def load_dataset(path: str) -> Dataset:
     records = []
     with open(path) as f:
         for line in f:
-            item = json.loads(line.strip())
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
             messages = item.get('messages', [])
-            # Convert chat format to single text string
             text = format_chat(messages)
-            records.append({'text': text})
+            if text:
+                records.append({'text': text})
     return Dataset.from_list(records)
 
+
 def format_chat(messages: list) -> str:
-    """Format chat messages into CodeLlama instruction format"""
+    """
+    Format chat messages into CodeLlama B_INST/E_INST instruction format.
+
+    Correct format merges the system block with the FIRST user turn:
+        [INST] <<SYS>>
+        {system}
+        <</SYS>>
+
+        {first_user_message} [/INST] {assistant_response}
+
+    Subsequent user turns:
+        [INST] {user_message} [/INST] {assistant_response}
+    """
     result = ""
+    system_content = ""
+    system_merged = False  # whether system has been merged into a user [INST] block
+
     for msg in messages:
-        role = msg['role']
-        content = msg['content']
+        role = msg.get('role', '')
+        content = msg.get('content', '')
+
         if role == 'system':
-            result += f"[INST] <<SYS>>\n{content}\n<</SYS>>\n\n"
+            system_content = content
+
         elif role == 'user':
-            if result.endswith("[INST] <<SYS>>\n"):
-                result += f"{content} [/INST]\n"
+            if system_content and not system_merged:
+                # Merge system + first user turn into one [INST] block
+                result += f"[INST] <<SYS>>\n{system_content}\n<</SYS>>\n\n{content} [/INST] "
+                system_merged = True
             else:
-                result += f"[INST] {content} [/INST]\n"
+                result += f"[INST] {content} [/INST] "
+
         elif role == 'assistant':
             result += f"{content}\n"
+
     return result.strip()
+
 
 def load_model_and_tokenizer(model_name: str):
     """Load model with 4-bit quantization for memory efficiency"""
@@ -100,6 +126,7 @@ def load_model_and_tokenizer(model_name: str):
     )
     model.config.use_cache = False
     return model, tokenizer
+
 
 def train():
     print(f"[Finetune] Loading base model: {BASE_MODEL}")
@@ -128,6 +155,7 @@ def train():
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     print(f"[Finetune] Model saved to {OUTPUT_DIR}")
+
 
 if __name__ == "__main__":
     train()
