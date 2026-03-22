@@ -4,6 +4,7 @@ Builds a spatial understanding of Vice City from parsed map data.
 - Known key locations (safe houses, mission triggers, businesses)
 - Coordinate validity checking
 - Interior detection
+- IPL-based location enrichment
 """
 
 import json
@@ -72,8 +73,9 @@ class MapLocation:
     y: float
     z: float
     zone: str
-    location_type: str  # 'mission_trigger', 'safe_house', 'business', 'gang_turf', 'interior'
+    location_type: str  # 'mission_trigger', 'safe_house', 'business', 'gang_turf', 'interior', 'ipl_object'
     description: str = ''
+
 
 class MapGraph:
     """
@@ -84,14 +86,15 @@ class MapGraph:
     - Random valid spawn points by area
     - Interior location lookup
     - Distance calculations
+    - IPL-based location enrichment
     """
 
     def __init__(self, zones_json: str = None, ipl_json: str = None):
         self.zones = []
         self.ipl_instances = []
         self.locations: Dict[str, MapLocation] = {}
-        self._build_known_locations()
 
+        # Load raw data FIRST so _build_known_locations can use self.zones
         if zones_json:
             with open(zones_json) as f:
                 self.zones = json.load(f)
@@ -99,12 +102,19 @@ class MapGraph:
             with open(ipl_json) as f:
                 self.ipl_instances = json.load(f).get('instances', [])
 
+        # Build locations after data is loaded
+        self._build_known_locations()
+
+        # Enrich with IPL cluster positions if IPL data is available
+        if self.ipl_instances:
+            self._enrich_from_ipl()
+
     def _build_known_locations(self):
         for name, data in KNOWN_LOCATIONS.items():
             x, y, z, desc = data
             self.locations[name] = MapLocation(
                 name=name, x=x, y=y, z=z,
-                zone=self._guess_zone(x, y),
+                zone=self.get_zone_for_coord(x, y),
                 location_type='mission_trigger',
                 description=desc
             )
@@ -116,6 +126,45 @@ class MapGraph:
                 location_type='interior',
                 description=f'Interior: {name}'
             )
+
+    def _enrich_from_ipl(self):
+        """
+        Add approximate cluster centres from IPL instances as MapLocation entries.
+        Divides the map into a coarse grid and records the centroid of each populated cell.
+        This gives real spatial coverage from placed objects.
+        """
+        CELL_SIZE = 200.0
+        cells: Dict[Tuple[int, int], List] = {}
+
+        for inst in self.ipl_instances:
+            try:
+                x, y, z = float(inst['x']), float(inst['y']), float(inst['z'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not self.is_valid_coord(x, y, z):
+                continue
+            cell_key = (int(x // CELL_SIZE), int(y // CELL_SIZE))
+            if cell_key not in cells:
+                cells[cell_key] = []
+            cells[cell_key].append((x, y, z))
+
+        for (cx, cy), pts in cells.items():
+            if len(pts) < 3:  # Skip nearly-empty cells
+                continue
+            avg_x = sum(p[0] for p in pts) / len(pts)
+            avg_y = sum(p[1] for p in pts) / len(pts)
+            avg_z = sum(p[2] for p in pts) / len(pts)
+            loc_name = f'ipl_cluster_{cx}_{cy}'
+            if loc_name not in self.locations:
+                self.locations[loc_name] = MapLocation(
+                    name=loc_name,
+                    x=round(avg_x, 3),
+                    y=round(avg_y, 3),
+                    z=round(avg_z, 3),
+                    zone=self.get_zone_for_coord(avg_x, avg_y),
+                    location_type='ipl_object',
+                    description=f'IPL object cluster ({len(pts)} objects)'
+                )
 
     def _guess_zone(self, x: float, y: float) -> str:
         """Rough zone estimation from coordinates"""
@@ -157,7 +206,7 @@ class MapGraph:
         for loc in self.locations.values():
             if location_type and loc.location_type != location_type:
                 continue
-            d = math.sqrt((loc.x - x)**2 + (loc.y - y)**2)
+            d = math.sqrt((loc.x - x) ** 2 + (loc.y - y) ** 2)
             if d < best_dist:
                 best_dist = d
                 best = loc
@@ -167,22 +216,22 @@ class MapGraph:
         return [l for l in self.locations.values()
                 if l.location_type == location_type]
 
-    def get_random_outdoor_coord(self, zone_name: str = None) -> Tuple[float,float,float]:
+    def get_random_outdoor_coord(self, zone_name: str = None) -> Tuple[float, float, float]:
         """Returns a random known outdoor coordinate, optionally filtered by zone"""
         import random
         candidates = list(KNOWN_LOCATIONS.values())
         if zone_name:
-            # Filter roughly
-            pass
+            # Filter roughly by zone guess
+            candidates = [v for v in candidates
+                          if self._guess_zone(v[0], v[1]) == zone_name.upper()] or candidates
         choice = random.choice(candidates)
-        # Add small random offset
         x = choice[0] + random.uniform(-20, 20)
         y = choice[1] + random.uniform(-20, 20)
         z = choice[2]
         return (round(x, 3), round(y, 3), round(z, 3))
 
-    def distance(self, x1,y1,z1, x2,y2,z2) -> float:
-        return math.sqrt((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2)
+    def distance(self, x1, y1, z1, x2, y2, z2) -> float:
+        return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
 
     def export_locations_json(self, out_path: str):
         data = {
