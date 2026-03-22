@@ -29,24 +29,24 @@ MISSION_CONCEPTS = [
         'name': 'NEWMIS2', 'display': 'The Deal',
         'type': 'delivery',
         'description': 'Pick up a package at the docks and deliver it to the mansion',
-        'start_location': 'vercetti_estate',
-        'required_vehicles': ['SENTINEL'],
+        'start_location': 'colonel_missions',
+        'required_vehicles': ['RUMPO'],
         'objectives': ['go_to_docks', 'pickup_package', 'deliver_to_mansion'],
     },
     {
-        'name': 'NEWMIS3', 'display': 'Gang Warfare',
+        'name': 'NEWMIS3', 'display': 'Gang War',
         'type': 'combat',
-        'description': 'Eliminate a rival gang at their hideout',
-        'start_location': 'vercetti_estate',
-        'required_vehicles': [],
-        'objectives': ['go_to_location', 'kill_gang_members', 'survive'],
+        'description': 'Attack a rival gang stronghold and eliminate all enemies',
+        'start_location': 'cubans',
+        'required_vehicles': ['PATRIOT'],
+        'objectives': ['drive_to_stronghold', 'kill_all_enemies', 'escape'],
     },
     {
-        'name': 'NEWMIS4', 'display': 'Wheelman',
-        'type': 'driving',
-        'description': 'Drive a contact to three locations across the city before time runs out',
-        'start_location': 'kaufman_cabs',
-        'required_vehicles': ['KAUFMAN'],
+        'name': 'NEWMIS4', 'display': 'The Getaway',
+        'type': 'escape',
+        'description': 'Rob the printworks and escape the police with the cash',
+        'start_location': 'vercetti_estate',
+        'required_vehicles': ['SENTINEL', 'POLICE'],
         'objectives': ['pickup_contact', 'drive_to_point1', 'drive_to_point2', 'drive_to_point3'],
     },
     {
@@ -56,6 +56,62 @@ MISSION_CONCEPTS = [
         'start_location': 'bank',
         'required_vehicles': [],
         'objectives': ['sneak_to_bank', 'grab_briefcase', 'escape_without_4stars'],
+    },
+    {
+        'name': 'NEWMIS6', 'display': 'Hired Muscle',
+        'type': 'escort',
+        'description': 'Escort a contact from the airport to the downtown safehouse',
+        'start_location': 'airport',
+        'required_vehicles': ['STRETCH'],
+        'objectives': ['go_to_airport', 'pick_up_contact', 'drive_to_safehouse', 'protect_contact'],
+    },
+    {
+        'name': 'NEWMIS7', 'display': 'Waterfront Hit',
+        'type': 'assassination',
+        'description': 'Take out a crime boss on his yacht before it leaves the docks',
+        'start_location': 'colonel_missions',
+        'required_vehicles': ['SPEEDER'],
+        'objectives': ['reach_yacht_by_boat', 'board_yacht', 'kill_boss', 'escape_by_sea'],
+    },
+    {
+        'name': 'NEWMIS8', 'display': 'Contraband Run',
+        'type': 'delivery',
+        'description': 'Transport stolen contraband through three checkpoints without police attention',
+        'start_location': 'bikers',
+        'required_vehicles': ['BOXVILLE'],
+        'objectives': ['pickup_cargo', 'checkpoint1', 'checkpoint2', 'checkpoint3', 'dropoff'],
+    },
+    {
+        'name': 'NEWMIS9', 'display': 'Bike Blitz',
+        'type': 'chase',
+        'description': 'Chase a courier on a PCJ600 across Vice Point and retrieve the stolen package',
+        'start_location': 'hotel_spawn',
+        'required_vehicles': ['PCJ600'],
+        'objectives': ['spot_courier', 'chase_bike', 'ram_off_road', 'grab_package'],
+    },
+    {
+        'name': 'NEWMIS10', 'display': 'Downtown Takedown',
+        'type': 'combat',
+        'description': 'Clear out a rival crew occupying the downtown construction site',
+        'start_location': 'downtown_ammu',
+        'required_vehicles': ['PATRIOT'],
+        'objectives': ['arm_up', 'reach_construction_site', 'kill_all_rivals', 'secure_area'],
+    },
+    {
+        'name': 'NEWMIS11', 'display': 'Drive or Die',
+        'type': 'timed_drive',
+        'description': 'Deliver a car wired with explosives to the junkyard within 3 minutes',
+        'start_location': 'vercetti_estate',
+        'required_vehicles': ['INFERNUS'],
+        'objectives': ['enter_rigged_car', 'drive_to_junkyard', 'escape_on_foot'],
+    },
+    {
+        'name': 'NEWMIS12', 'display': 'Payback',
+        'type': 'assassination',
+        'description': 'Eliminate three targets across Vice City using only a sniper rifle',
+        'start_location': 'lawyer_office',
+        'required_vehicles': [],
+        'objectives': ['collect_sniper', 'kill_target1', 'kill_target2', 'kill_target3', 'escape'],
     },
 ]
 
@@ -85,17 +141,18 @@ class MissionGenerator:
 
     def _generate(self, prompt: str, max_new_tokens: int = 1024) -> str:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        prompt_len = inputs["input_ids"].shape[1]
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 temperature=0.7,
                 do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.1,
-                pad_token_id=self.tokenizer.eos_token_id
+                pad_token_id=self.tokenizer.eos_token_id,
             )
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Decode only the newly generated tokens, not the prompt
+        new_tokens = outputs[0][prompt_len:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     def generate_trigger_script(self, concept: Dict,
                                  mission_index: int,
@@ -103,29 +160,61 @@ class MissionGenerator:
         """Generate the trigger/ambient script for a mission concept."""
         x, y, z = trigger_coord
         name = concept['name']
-        display = concept['display']
+        desc = concept['description']
 
         prompt = f"""[INST] <<SYS>>
-{self.tokenizer.decode([], skip_special_tokens=True)}You are an expert GTA Vice City SCM script writer. Write syntactically correct SCM scripts.
+You are an expert GTA Vice City SCM script writer. Write complete, valid SCM code.
 <</SYS>>
 
-Write a GTA VC SCM trigger script for mission '{display}' with script name '{name}'.
-The mission trigger is at coordinates X={x}, Y={y}, Z={z}.
-Mission index is {mission_index}.
-The script should:
-1. Use script_name '{name}'
-2. Loop with wait 500
-3. Check if $passed_{name} == 1 and terminate_this_script if so
-4. Check Player.Defined, locate_player_on_foot_3d with radius 2.0 2.0 2.0, $onmission == 0, Player.Controllable
-5. Set $onmission = 1, Player.MakeSafe, print_big '{name[:8]}' 15000 ms 2
-6. Call load_and_launch_mission_internal {mission_index}
+Write a GTA VC SCM TRIGGER SCRIPT for mission index {mission_index}.
+Mission name: {concept['display']}
+Description: {desc}
+Trigger coord: {x} {y} {z}
+Script label: @{name}
 
-[/INST]
-"""
+Requirements:
+- Check $passed_{name} == 1 at top, terminate_this_script if already done
+- Poll loop with wait 500
+- Check Player.Defined and not $onmission == 1
+- Use locate_player_on_foot_3d at {x} {y} {z} radius 2.0 2.0 2.0
+- Set $onmission = 1 before load_and_launch_mission_internal {mission_index}
+- End with terminate_this_script
+[/INST]"""
+
         result = self._generate(prompt, max_new_tokens=512)
-        if "[/INST]" in result:
-            result = result.split("[/INST]")[-1].strip()
+        # Fallback to template if generation is empty or too short
+        if len(result.strip()) < 50:
+            result = self._template_trigger(name, mission_index, x, y, z)
         return result
+
+    def _template_trigger(self, name: str, mission_index: int,
+                           x: float, y: float, z: float) -> str:
+        """Fallback template trigger when LLM output is insufficient."""
+        return f"""
+:{name}
+script_name '{name[:8]}'
+
+:{name}_LOOP
+wait 500
+if
+  $passed_{name} == 1
+goto_if_false @{name}_CHECK
+terminate_this_script
+
+:{name}_CHECK
+if
+  Player.Defined($player_char)
+goto_if_false @{name}_LOOP
+if
+  not $onmission == 1
+goto_if_false @{name}_LOOP
+if
+  locate_player_on_foot_3d $player_char 0 {x} {y} {z} radius 2.0 2.0 2.0
+goto_if_false @{name}_LOOP
+$onmission = 1
+load_and_launch_mission_internal {mission_index}
+terminate_this_script
+"""
 
     def generate_mission_body(self, concept: Dict) -> str:
         """Generate the full mission body script."""
@@ -142,6 +231,7 @@ The script should:
 
         obj_text = '\n'.join(f'- {obj}' for obj in objectives)
         veh_text = ', '.join(f'#{v}' for v in vehicles) if vehicles else 'any vehicle'
+        name = concept['name']
 
         prompt = f"""[INST] <<SYS>>
 You are an expert GTA Vice City SCM mission script writer. Write complete, valid SCM code.
@@ -150,33 +240,77 @@ You are an expert GTA Vice City SCM mission script writer. Write complete, valid
 Write a complete GTA VC SCM MISSION body script for:
 Mission name: {concept['display']}
 Description: {desc}
-Start location: {start_loc} (X={x}, Y={y}, Z={z})
-Vehicles used: {veh_text}
-Objectives in order:
+Start location: {x} {y} {z}
+Vehicles needed: {veh_text}
+Objectives:
 {obj_text}
 
 Requirements:
-- Use proper labels like :MISSIONNAME_step
-- Declare and use $onmission flag
-- Handle mission failure (player death) with end_thread
-- Handle mission success: print_now 'M_PASS', add_score, $passed_{concept['name']} = 1, end_thread
-- Use real Vice City coordinates
-- Include Blip.Remove and actor/vehicle cleanup before ending
-- Use wait 0 in active loops, wait 500 in polling loops
+- Label: @{name}
+- script_name '{name[:8]}'
+- Spawn required vehicles and actors
+- Add radar blips with Blip.AddForCoord or Blip.AddForCar
+- Use TIMERA for any time limit
+- Check Actor.Dead($player_actor) for fail condition
+- Set $passed_{name} = 1 and $onmission = 0 on success
+- print_now 'M_PASS' on pass, 'M_FAIL' on fail
+- end_thread at conclusion
+[/INST]"""
 
-[/INST]
-"""
-        result = self._generate(prompt, max_new_tokens=1500)
-        if "[/INST]" in result:
-            result = result.split("[/INST]")[-1].strip()
+        result = self._generate(prompt, max_new_tokens=1024)
+        if len(result.strip()) < 100:
+            result = self._template_mission_body(name, x, y, z)
         return result
+
+    def _template_mission_body(self, name: str,
+                                x: float, y: float, z: float) -> str:
+        """Fallback template mission body when LLM output is insufficient."""
+        ox = round(x + 50.0, 3)
+        oy = round(y + 50.0, 3)
+        return f"""
+:{name}
+script_name '{name[:8]}'
+$player_actor = Actor.EmulateFromPlayer($player_char)
+Player.CanMove($player_char, False)
+do_fade 0 500
+wait 500
+do_fade 1 500
+Player.CanMove($player_char, True)
+$obj_marker = Blip.AddForCoord({ox}, {oy}, {z})
+Blip.ChangeDisplay($obj_marker, 2)
+print_big '{name[:8]}' time 5000 style 1
+
+:{name}_MAIN
+wait 0
+if
+  Actor.Dead($player_actor)
+goto_if_false @{name}_OBJ
+Blip.Remove($obj_marker)
+$onmission = 0
+print_now 'M_FAIL' time 3000 1
+end_thread
+
+:{name}_OBJ
+if
+  locate_player_on_foot_3d $player_char 0 {ox} {oy} {z} radius 5.0 5.0 5.0
+goto_if_false @{name}_MAIN
+Blip.Remove($obj_marker)
+$passed_{name} = 1
+$onmission = 0
+add_score $player_char score 1000
+player_made_progress 1
+print_now 'M_PASS' time 5000 1
+end_thread
+"""
 
     def generate_full_mod(self, num_missions: int = 5,
                           output_path: str = "output/new_main.scm") -> str:
         """Generate a complete new main.scm mod."""
         print(f"[MissionGenerator] Generating {num_missions} missions...")
 
-        selected = random.sample(MISSION_CONCEPTS, min(num_missions, len(MISSION_CONCEPTS)))
+        # Cap at available concepts
+        num_missions = min(num_missions, len(MISSION_CONCEPTS))
+        selected = random.sample(MISSION_CONCEPTS, num_missions)
         trigger_scripts = []
         mission_bodies = []
 
@@ -238,6 +372,7 @@ Camera.SetAtPos(83.0, -849.8, 9.3)
 $player_char = Player.Create(0, 83.0, -849.8, 9.3)
 $player_actor = Actor.EmulateFromPlayer($player_char)
 declare_mission_flag $onmission
+$onmission = 0
 load_and_launch_mission_internal 0 // Initial
 
 {car_generators}
@@ -348,13 +483,15 @@ end_thread
         return '\n'.join(f"start_new_script @{name}" for name in names)
 
     def _intro_mission(self) -> str:
-        return """
+        # mission index 2 is the first user mission only when missions exist
+        first_mission_idx = 2 if self.missions else 0
+        return f"""
 :INTRO
 script_name 'INTRO'
 set_camera_behind_player
 Camera.SetAtPos(83.0, -849.8, 9.3)
 do_fade 1 2000
-load_and_launch_mission_internal 2
+load_and_launch_mission_internal {first_mission_idx}
 end_thread
 """
 
