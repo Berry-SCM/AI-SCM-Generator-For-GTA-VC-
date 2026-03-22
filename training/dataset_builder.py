@@ -7,9 +7,11 @@ Training pair formats:
 2. Mission structure:  "Write a mission that [desc]" -> full mission script
 3. Script completion:  first-half -> second-half of real scripts
 4. Coordinate pairs:   "Place something at [location]" -> SCM with correct coords
+5. ID reference:       "What ID is the taxi?" -> "150" (from parsed default.ide)
 """
 
 import json
+import os
 import random
 from typing import List, Dict
 
@@ -64,46 +66,59 @@ if
   Player.Defined($player_char)
 goto_if_false @MYMISSION_LOOP
 if
+  not $onmission == 1
+goto_if_false @MYMISSION_LOOP
+if
   locate_player_on_foot_3d $player_char 0 200.0 -800.0 10.5 radius 2.0 2.0 2.0
 goto_if_false @MYMISSION_LOOP
-if
-  $onmission == 0
-goto_if_false @MYMISSION_LOOP
-if
-  Player.Controllable($player_char)
-goto_if_false @MYMISSION_LOOP
 $onmission = 1
-Player.MakeSafe($player_char)
-print_big 'MY_MISS' 15000 ms 2
-load_and_launch_mission_internal 5
-goto @MYMISSION_LOOP'''
+load_and_launch_mission_internal 3
+terminate_this_script'''
     },
-    'pickup': {
-        'prompt': 'How do I create a pickup (weapon, health, etc) in SCM?',
-        'completion': '''// Create a weapon pickup (type 8 = on-street, respawns after pickup)
-$pickup = Pickup.Create(#COLT45, 8, 200.0, -800.0, 10.5)
-// Create a health pickup (type 3 = once only)
-$hp_pickup = Pickup.Create(#HEALTH, 3, 200.0, -810.0, 10.5)
-// Check if player picked it up (poll in loop)
+    'create_pickup': {
+        'prompt': 'How do I create a pickup object in GTA VC SCM?',
+        'completion': '''// Pickup types: 1=on ground, 2=floating, 3=regenerate, 15=money
+$pickup = Pickup.Create(#HEALTH, 15, 83.0, -849.8, 9.3)
+// Check if player collected it
 if
-  Pickup.Picked_up($pickup)
-goto_if_false @NOT_PICKED
-// do something on pickup
-:NOT_PICKED'''
+  Pickup.Collected($pickup)
+goto_if_false @PICKUP_LOOP
+// Pickup collected
+Pickup.Destroy($pickup)'''
     },
-    'marker': {
-        'prompt': 'How do I add a blip/marker on the radar in SCM?',
-        'completion': '''// Add blip for a coordinate
+    'blip_marker': {
+        'prompt': 'How do I add a radar blip / marker in GTA VC SCM?',
+        'completion': '''// Add blip on a coord (type 0 = red square)
 $blip = Blip.AddForCoord(200.0, -800.0, 10.5)
-// Or add sprite blip (icon 27 = yellow star)
-add_sprite_blip_for_coord $blip2 = create_marker 27 at 200.0 -800.0 10.5
-// Hide marker until needed
-Marker.Disable($blip)
-// Remove marker when done
+Blip.ChangeDisplay($blip, 2)  // 2 = blip only visible on map
+// Or add to a vehicle
+$car_blip = Blip.AddForCar($car)
+// Remove when done
 Blip.Remove($blip)'''
     },
+    'mission_pass_fail': {
+        'prompt': 'How do I handle mission pass and fail in GTA VC SCM?',
+        'completion': ''':MISSION_FAIL_CHECK
+if
+  Actor.Dead($player_actor)
+goto_if_false @MISSION_MAIN
+// Player died - mission fail
+Blip.Remove($obj_marker)
+$onmission = 0
+print_now 'M_FAIL' time 3000 1
+end_thread
+
+:MISSION_PASS
+Blip.Remove($obj_marker)
+$passed_MYMISSION = 1
+$onmission = 0
+add_score $player_char score 1000
+player_made_progress 1
+print_now 'M_PASS' time 5000 1
+end_thread'''
+    },
     'timer': {
-        'prompt': 'How do I use timers in GTA VC SCM?',
+        'prompt': 'How do I use a countdown timer in GTA VC SCM?',
         'completion': '''// TIMERA and TIMERB are built-in millisecond counters
 TIMERA = 0
 
@@ -133,7 +148,9 @@ switch_widescreen 1
 wait 3000
 // Restore player camera
 Camera.Restore()
-switch_widescreen 0
+set_area_visible 0
+Player.CanMove($player_char, True)
+release_weather
 // Fade back in
 do_fade 1 1000'''
     },
@@ -210,7 +227,7 @@ class DatasetBuilder:
                 ]
             })
 
-            # Pair 2: Script completion (first half → second half)
+            # Pair 2: Script completion (first half -> second half)
             if len(raw_lines) > 20:
                 half = len(raw_lines) // 2
                 first_half = '\n'.join(raw_lines[:half])
@@ -269,10 +286,138 @@ class DatasetBuilder:
             })
         print(f"[DatasetBuilder] Added {len(self.pairs) - count_before} coord pairs")
 
+    def build_id_reference_pairs(self):
+        """
+        Build vehicle/ped/weapon ID reference training pairs from the parsed IDE file.
+        Teaches the model: 'What ID is the taxi?' -> '150 (#TAXI)'
+        Only runs if data/processed/ide_entries.json exists (produced by run_parse).
+        """
+        ide_path = "data/processed/ide_entries.json"
+        if not os.path.exists(ide_path):
+            print("[DatasetBuilder] Skipping ID pairs: ide_entries.json not found (run --mode parse first)")
+            return
+
+        with open(ide_path) as f:
+            ide_data = json.load(f)
+
+        entries = ide_data.get('entries', [])
+        count_before = len(self.pairs)
+
+        # Group by type for bulk Q&A
+        cars, peds, weapons = [], [], []
+        for e in entries:
+            etype = e.get('entry_type', '')
+            if etype == 'cars':
+                cars.append(e)
+            elif etype == 'peds':
+                peds.append(e)
+            elif etype == 'weap':
+                weapons.append(e)
+
+        # --- Individual ID lookup pairs ---
+        for e in cars:
+            name = e.get('model_name', '')
+            eid = e.get('id', '')
+            if not name or not eid:
+                continue
+            self.pairs.append({
+                'type': 'id_reference',
+                'messages': [
+                    {'role': 'user',
+                     'content': f'What is the vehicle model ID for {name} in GTA Vice City SCM?'},
+                    {'role': 'assistant',
+                     'content': (f'The vehicle {name} has model ID {eid}. '
+                                 f'In SCM use: $car = Car.Create(#{name.upper()}, x, y, z)')}
+                ]
+            })
+
+        for e in peds:
+            name = e.get('model_name', '')
+            eid = e.get('id', '')
+            if not name or not eid:
+                continue
+            self.pairs.append({
+                'type': 'id_reference',
+                'messages': [
+                    {'role': 'user',
+                     'content': f'What is the ped skin ID for {name} in GTA Vice City?'},
+                    {'role': 'assistant',
+                     'content': (f'The ped {name} has skin ID {eid}. '
+                                 f'In SCM use: $actor = Actor.Create(pedtype, #{name.upper()}, x, y, z)')}
+                ]
+            })
+
+        for e in weapons:
+            name = e.get('model_name', '')
+            eid = e.get('id', '')
+            if not name or not eid:
+                continue
+            self.pairs.append({
+                'type': 'id_reference',
+                'messages': [
+                    {'role': 'user',
+                     'content': f'What is the weapon ID for {name} in GTA Vice City SCM?'},
+                    {'role': 'assistant',
+                     'content': (f'The weapon {name} has ID {eid}. '
+                                 f'In SCM use: give_weapon_to_char $actor weapon {eid} ammo 100')}
+                ]
+            })
+
+        # --- Bulk list pairs (teach the model the full ID tables) ---
+        if cars:
+            car_list = '\n'.join(
+                f"  {e['id']:>3}: #{e['model_name'].upper()}" for e in cars
+                if e.get('id') and e.get('model_name')
+            )
+            self.pairs.append({
+                'type': 'id_reference',
+                'messages': [
+                    {'role': 'user',
+                     'content': 'List all vehicle model IDs available in GTA Vice City SCM.'},
+                    {'role': 'assistant',
+                     'content': f'Vehicle IDs (use as #MODELNAME in Car.Create):\n{car_list}'}
+                ]
+            })
+
+        if weapons:
+            weap_list = '\n'.join(
+                f"  {e['id']:>3}: {e['model_name']}" for e in weapons
+                if e.get('id') and e.get('model_name')
+            )
+            self.pairs.append({
+                'type': 'id_reference',
+                'messages': [
+                    {'role': 'user',
+                     'content': 'List all weapon IDs available in GTA Vice City SCM.'},
+                    {'role': 'assistant',
+                     'content': f'Weapon IDs (use as integer in give_weapon_to_char):\n{weap_list}'}
+                ]
+            })
+
+        if peds:
+            ped_list = '\n'.join(
+                f"  {e['id']:>3}: #{e['model_name'].upper()}" for e in peds
+                if e.get('id') and e.get('model_name')
+            )
+            self.pairs.append({
+                'type': 'id_reference',
+                'messages': [
+                    {'role': 'user',
+                     'content': 'List all ped skin IDs available in GTA Vice City SCM.'},
+                    {'role': 'assistant',
+                     'content': f'Ped skin IDs (use as #MODELNAME in Actor.Create):\n{ped_list}'}
+                ]
+            })
+
+        added = len(self.pairs) - count_before
+        print(f"[DatasetBuilder] Added {added} ID reference pairs "
+              f"({len(cars)} vehicles, {len(peds)} peds, {len(weapons)} weapons)")
+
     def build_all(self) -> List[Dict]:
         self.build_opcode_pairs()
         self.build_script_pairs()
         self.build_coord_pairs()
+        self.build_id_reference_pairs()   # ← new: was missing entirely
         return self.pairs
 
     def save_jsonl(self, out_path: str):
